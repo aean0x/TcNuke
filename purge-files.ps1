@@ -115,33 +115,44 @@ function Find-MatchesInTarget($target)
     return $results
 }
 
-# ── Phase 3: Full-disk sweep (optional, uses native `dir`) ──────────────────
+# ── Phase 3: Full-disk sweep (parallel, single pass per drive) ──────────────
 
 function Find-AllDriveMatches
 {
-    $results = [System.Collections.Generic.List[string]]::new()
-
-    # Search all fixed drives
     $drives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Used -ne $null } | ForEach-Object { "$($_.Root)" }
 
-    foreach ($drive in $drives)
-    {
-        foreach ($pattern in $namePatterns)
-        {
-            Write-Host "    dir $drive /s /b /ad *${pattern}*" -ForegroundColor DarkGray
+    # Build combined regex once: Beckhoff|TwinCAT|TcXae|...
+    $combinedPattern = ($namePatterns | ForEach-Object { [regex]::Escape($_) }) -join "|"
 
-            # Directories matching pattern
-            $output = cmd /c "dir `"$drive`" /s /b /ad 2>nul" | Select-String -Pattern $pattern -SimpleMatch
-            foreach ($line in $output)
+    Write-Host "  Launching parallel scan across $($drives.Count) drive(s)..." -ForegroundColor DarkGray
+
+    $jobs = foreach ($drive in $drives)
+    {
+        Write-Host "    -> $drive" -ForegroundColor DarkGray
+        Start-ThreadJob -ArgumentList $drive, $combinedPattern -ScriptBlock {
+            param($drv, $pattern)
+            $found = [System.Collections.Generic.List[string]]::new()
+            $lines = cmd /c "dir `"$drv`" /s /b /ad 2>nul"
+            foreach ($line in $lines)
             {
-                $trimmed = $line.Line.Trim()
-                if ($trimmed -and $trimmed -notmatch "\\Windows\\(WinSxS|servicing|assembly)")
+                if ($line -match $pattern -and $line -notmatch "\\Windows\\(WinSxS|servicing|assembly)")
                 {
-                    if ($trimmed -notin $results)
-                    { $results.Add($trimmed)
-                    }
+                    $found.Add($line)
                 }
             }
+            return $found
+        }
+    }
+
+    Write-Host "  Waiting for $($jobs.Count) job(s)..." -ForegroundColor DarkGray
+
+    $results = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($job in $jobs)
+    {
+        $jobResults = Receive-Job -Job $job -Wait -AutoRemoveJob
+        foreach ($item in $jobResults)
+        {
+            [void]$results.Add($item)
         }
     }
 
